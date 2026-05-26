@@ -12,8 +12,13 @@ This file does NOT touch ingest.py or the embedder. It reuses ask.py's
 ChromaDB at ./whatsapp_vector_db.
 """
 from __future__ import annotations
-import io
 import os
+# MUST be set before chromadb / opentelemetry imports. Works around a protobuf
+# descriptor mismatch when chromadb's bundled _pb2.py files run under newer
+# protobuf (e.g. Python 3.14 on Streamlit Cloud).
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+import io
 import sys
 import csv
 from datetime import date, datetime
