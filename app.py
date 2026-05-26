@@ -39,16 +39,44 @@ except Exception:
 
 # --- LLM config (OpenRouter, OpenAI-compatible) ----------------------------
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "qwen/qwen3-30b-a3b:free"
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+# Fallback list used only if the live API fetch fails.
 FALLBACK_MODELS = [
     DEFAULT_MODEL,
-    "meta-llama/llama-3.3-70b-instruct:free",
     "deepseek/deepseek-chat-v3.1:free",
     "deepseek/deepseek-r1:free",
     "google/gemma-3-27b-it:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
 ]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_free_openrouter_models():
+    """Ask OpenRouter for the current free-tier model list.
+    Free = prompt and completion price both zero. Cached 1h to be polite.
+    Returns a sorted list of model IDs. Falls back to FALLBACK_MODELS on failure.
+    """
+    try:
+        import urllib.request, json
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"User-Agent": "whatsapp-forensic-audit/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        free = []
+        for m in data.get("data", []):
+            p = m.get("pricing") or {}
+            try:
+                if float(p.get("prompt", 1)) == 0 and float(p.get("completion", 1)) == 0:
+                    mid = m.get("id", "")
+                    if mid:
+                        free.append(mid)
+            except (TypeError, ValueError):
+                continue
+        return sorted(free) if free else list(FALLBACK_MODELS)
+    except Exception:
+        return list(FALLBACK_MODELS)
 
 import ask
 import chromadb
@@ -447,13 +475,27 @@ with st.sidebar:
     n_chunks = st.slider("Chunks to retrieve", 10, 200, 40, step=10)
 
     st.subheader("LLM (via OpenRouter)")
+    live_models = fetch_free_openrouter_models()
+    # Pick a sensible default if it exists in the live list.
+    preferred_defaults = [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-chat-v3.1:free",
+        "deepseek/deepseek-r1:free",
+        "google/gemma-3-27b-it:free",
+    ]
+    default_idx = 0
+    for d in preferred_defaults:
+        if d in live_models:
+            default_idx = live_models.index(d)
+            break
     model = st.selectbox(
-        "Model",
-        FALLBACK_MODELS,
-        index=0,
+        f"Model ({len(live_models)} free models live now)",
+        live_models,
+        index=default_idx,
         help=(
-            "Free OpenRouter models. If one is rate-limited or unavailable, "
-            "try another. Requires `OPENROUTER_API_KEY` in Streamlit Secrets."
+            "Auto-fetched from OpenRouter's `/api/v1/models` endpoint, filtered "
+            "to models priced at $0/token. Refreshes hourly. "
+            "Requires `OPENROUTER_API_KEY` in Streamlit Secrets."
         ),
     )
     custom_model = st.text_input(
