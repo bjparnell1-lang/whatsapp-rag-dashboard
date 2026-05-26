@@ -1,0 +1,4 @@
+whatsapp_vector_db/
+*.txt
+*.zip
+.env
