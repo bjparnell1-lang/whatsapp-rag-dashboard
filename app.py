@@ -53,16 +53,26 @@ DB_PATH = ask.default_db()
 COLLECTION = "whatsapp_messages"
 
 
-def _account_owner_from_file(file_path: str) -> str:
-    """Derive an 'account owner' label from the chat file path.
-    `<root>/<account_owner>/<folder_source>/_chat.txt`  -> account_owner
-    Falls back to '(root)' if there is no extra layer.
+CATEGORIES = ["Robert", "Kharka", "Group"]
+
+
+def _is_robert_path(file_path: str) -> bool:
+    """True if the chat sits inside the Bj/ subfolder (Robert's exports)."""
+    fp = (file_path or "").replace("\\", "/").lower()
+    return "/bj/" in fp
+
+
+def classify_chat(chat_name: str, file_path: str, unique_sender_count: int) -> str:
     """
-    try:
-        p = Path(file_path)
-        return p.parent.parent.name or "(root)"
-    except Exception:
-        return "(unknown)"
+    Robert -> file lives under Bj/ (Robert's WhatsApp exports)
+    Group  -> chat has more than 2 unique senders (group chat)
+    Kharka -> everything else (1-on-1 chats from the main account)
+    """
+    if _is_robert_path(file_path):
+        return "Robert"
+    if unique_sender_count > 2:
+        return "Group"
+    return "Kharka"
 
 
 @st.cache_resource(show_spinner=False)
@@ -80,12 +90,15 @@ def open_collection():
 
 @st.cache_data(show_spinner="Indexing chats and date range...")
 def load_facets():
-    """Walk metadata to compute facets for the sidebar."""
+    """Walk metadata to compute facets for the sidebar.
+    Aggregates unique senders per chat so we can classify each chat
+    as Robert / Kharka / Group exactly once (not per-chunk).
+    """
     col = open_collection()
     total = col.count()
-    # Pull metadatas in pages so we don't blow up memory.
     chats = set()
-    owners = set()
+    chat_senders: dict[str, set[str]] = {}   # chat_name -> set of senders
+    chat_file: dict[str, str] = {}           # chat_name -> a representative file path
     earliest, latest = None, None
     BATCH = 1000
     fetched = 0
@@ -95,8 +108,13 @@ def load_facets():
         if not metas:
             break
         for m in metas:
-            chats.add(m.get("chat_name", ""))
-            owners.add(_account_owner_from_file(m.get("file", "")))
+            cname = m.get("chat_name", "")
+            chats.add(cname)
+            chat_file.setdefault(cname, m.get("file", ""))
+            for s in (m.get("senders", "") or "").split(" | "):
+                s = s.strip()
+                if s:
+                    chat_senders.setdefault(cname, set()).add(s)
             for k in ("start_date", "end_date"):
                 v = m.get(k, "")
                 try:
@@ -108,18 +126,27 @@ def load_facets():
                 if latest is None or d > latest:
                     latest = d
         fetched += len(metas)
+
+    # Classify each chat into a category.
+    chat_category: dict[str, str] = {}
+    for c in chats:
+        chat_category[c] = classify_chat(
+            c, chat_file.get(c, ""), len(chat_senders.get(c, set()))
+        )
+
     return {
         "chats": sorted(c for c in chats if c),
-        "owners": sorted(o for o in owners if o),
+        "chat_category": chat_category,
+        "chat_senders": {c: sorted(s) for c, s in chat_senders.items()},
         "earliest": earliest or date(2020, 1, 1),
         "latest": latest or date.today(),
         "total": total,
     }
 
 
-def run_query(question, n, chat_names, owner_names, has_voice, has_call, has_media,
-              start_d, end_d):
-    """Run ask.query() then apply post-hoc filters (chat/owner/date/has_media)."""
+def run_query(question, n, chat_names, categories, has_voice, has_call, has_media,
+              start_d, end_d, chat_category_map):
+    """Run ask.query() then apply post-hoc filters (chat/category/date/has_media)."""
     args = SimpleNamespace(
         db=DB_PATH,
         collection=COLLECTION,
@@ -132,13 +159,14 @@ def run_query(question, n, chat_names, owner_names, has_voice, has_call, has_med
     hits = ask.query(args)
 
     chats_set = set(chat_names or [])
-    owners_set = set(owner_names or [])
+    cats_set = set(categories or [])
 
     def keep(h):
         m = h["meta"]
-        if chats_set and m.get("chat_name", "") not in chats_set:
+        cname = m.get("chat_name", "")
+        if chats_set and cname not in chats_set:
             return False
-        if owners_set and _account_owner_from_file(m.get("file", "")) not in owners_set:
+        if cats_set and chat_category_map.get(cname, "Kharka") not in cats_set:
             return False
         if has_media and m.get("has_media") != "1":
             return False
@@ -204,11 +232,11 @@ def read_context_window(file_path: str, start_line: int, end_line: int,
     return "\n".join(out) or "[context unavailable: line range empty]"
 
 
-def hits_to_csv(hits, ai_summary: str | None) -> bytes:
+def hits_to_csv(hits, ai_summary: str | None, chat_category_map: dict) -> bytes:
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow([
-        "chat_name", "account_owner", "start_date", "end_date",
+        "chat_name", "category", "start_date", "end_date",
         "start_line", "end_line", "senders",
         "has_voice", "has_call", "has_media", "distance", "chunk_text",
     ])
@@ -216,7 +244,7 @@ def hits_to_csv(hits, ai_summary: str | None) -> bytes:
         m = h["meta"]
         w.writerow([
             m.get("chat_name", ""),
-            _account_owner_from_file(m.get("file", "")),
+            chat_category_map.get(m.get("chat_name", ""), ""),
             m.get("start_date", ""),
             m.get("end_date", ""),
             m.get("start_line", ""),
@@ -315,17 +343,40 @@ st.success(
 with st.sidebar:
     st.header("Filters")
 
-    sel_owners = st.multiselect(
-        "Account owner (folder containing the chat)",
-        facets["owners"],
+    sel_categories = st.multiselect(
+        "Account / category",
+        CATEGORIES,
         default=[],
-        help="Derived from the folder one level above each chat folder.",
+        help=(
+            "**Robert** = chats from the `Bj/` subfolder (your personal exports). "
+            "**Kharka** = 1-on-1 chats from the main account. "
+            "**Group** = chats with more than 2 participants."
+        ),
     )
+
+    # Chat options narrow down to whatever categories are selected.
+    if sel_categories:
+        chat_options = [
+            c for c in facets["chats"]
+            if facets["chat_category"].get(c) in set(sel_categories)
+        ]
+    else:
+        chat_options = facets["chats"]
+
     sel_chats = st.multiselect(
-        "Chat",
-        facets["chats"],
+        "Specific chats (optional)",
+        chat_options,
         default=[],
+        help="Narrow further to specific chat threads within the chosen categories.",
     )
+
+    # Show a small breakdown so you can sanity-check the classification.
+    with st.expander("How chats are categorized", expanded=False):
+        for cat in CATEGORIES:
+            members = [c for c, v in facets["chat_category"].items() if v == cat]
+            st.markdown(f"**{cat}** ({len(members)})")
+            for c in sorted(members):
+                st.markdown(f"- {c}")
 
     st.subheader("Evidence type")
     f_voice = st.checkbox("Voice notes / audio", value=False)
@@ -377,12 +428,13 @@ if run:
                 question.strip(),
                 n=n_chunks,
                 chat_names=sel_chats,
-                owner_names=sel_owners,
+                categories=sel_categories,
                 has_voice=f_voice,
                 has_call=f_call,
                 has_media=f_media,
                 start_d=date_range[0],
                 end_d=date_range[1],
+                chat_category_map=facets["chat_category"],
             )
         except Exception as e:
             st.error(f"Retrieval failed: {e}")
@@ -434,10 +486,10 @@ if last:
             if m.get("has_media") == "1":
                 tags.append("🖼 media")
             tag_str = "  ".join(tags)
-            owner = _account_owner_from_file(m.get("file", ""))
+            category = facets["chat_category"].get(m.get("chat_name", ""), "")
             header = (
                 f"**{i}. {m.get('chat_name','(unknown)')}**  ·  "
-                f"`{owner}`  ·  "
+                f"`{category}`  ·  "
                 f"{m.get('start_date','')} → {m.get('end_date','')}  ·  "
                 f"lines {m.get('start_line','')}-{m.get('end_line','')}  "
                 f"{tag_str}"
@@ -466,7 +518,7 @@ if last:
     with c1:
         st.download_button(
             "Download CSV",
-            data=hits_to_csv(hits, ai_summary),
+            data=hits_to_csv(hits, ai_summary, facets["chat_category"]),
             file_name=f"whatsapp-audit-{ts}.csv",
             mime="text/csv",
             use_container_width=True,
