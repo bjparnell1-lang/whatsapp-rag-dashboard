@@ -13,6 +13,7 @@ ChromaDB at ./whatsapp_vector_db.
 """
 from __future__ import annotations
 import io
+import os
 import sys
 import csv
 from datetime import date, datetime
@@ -23,10 +24,20 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Hoist Streamlit Cloud secrets into os.environ so ask.call_llm() can read them.
+try:
+    if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    pass
+
 import ask
 import chromadb
 from chromadb.config import Settings
 from embedding import TfidfSvdEmbeddingFunction
+
+# Folder inside the repo that mirrors each chat's source .txt for context view.
+LOCAL_CHATS_ROOT = Path(__file__).resolve().parent / "chats"
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +158,33 @@ def run_query(question, n, chat_names, owner_names, has_voice, has_call, has_med
     return [h for h in hits if keep(h)]
 
 
-def read_context_window(file_path: str, start_line: int, end_line: int,
-                         pad: int = 10) -> str:
-    """Pull lines [start_line-pad, end_line+pad] from the source .txt."""
+def _resolve_chat_file(file_path: str, folder_source: str) -> Path | None:
+    """Find the .txt for context view.
+    Tries the original (Windows) path first, then `chats/<folder_source>/_chat.txt`
+    inside the repo so it works on Streamlit Cloud (Linux).
+    """
     p = Path(file_path)
-    if not p.exists():
-        return f"[context unavailable: file not found at {file_path}]"
+    if p.exists():
+        return p
+    if folder_source:
+        candidate = LOCAL_CHATS_ROOT / folder_source / "_chat.txt"
+        if candidate.exists():
+            return candidate
+    # Last resort: match by basename anywhere under chats/
+    if LOCAL_CHATS_ROOT.exists():
+        for c in LOCAL_CHATS_ROOT.rglob("_chat.txt"):
+            if folder_source and folder_source in str(c):
+                return c
+    return None
+
+
+def read_context_window(file_path: str, start_line: int, end_line: int,
+                         pad: int = 10, folder_source: str = "") -> str:
+    """Pull lines [start_line-pad, end_line+pad] from the source .txt."""
+    p = _resolve_chat_file(file_path, folder_source)
+    if p is None:
+        return (f"[context unavailable: could not locate source file. "
+                f"Tried `{file_path}` and `chats/{folder_source}/_chat.txt`.]")
     lo = max(1, start_line - pad)
     hi = end_line + pad
     out = []
@@ -414,6 +446,7 @@ if last:
                         int(m.get("start_line", 1) or 1),
                         int(m.get("end_line", 1) or 1),
                         pad=10,
+                        folder_source=m.get("folder_source", ""),
                     )
                     st.code(ctx, language="text")
                 st.caption(f"distance={h.get('distance', 0):.3f}  ·  "
