@@ -39,13 +39,15 @@ except Exception:
 
 # --- LLM config (OpenRouter, OpenAI-compatible) ----------------------------
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+DEFAULT_MODEL = "qwen/qwen3-30b-a3b:free"
 FALLBACK_MODELS = [
     DEFAULT_MODEL,
     "meta-llama/llama-3.3-70b-instruct:free",
     "deepseek/deepseek-chat-v3.1:free",
-    "google/gemini-2.0-flash-exp:free",
-    "qwen/qwen3-30b-a3b:free",
+    "deepseek/deepseek-r1:free",
+    "google/gemma-3-27b-it:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
 ]
 
 import ask
