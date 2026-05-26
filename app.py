@@ -29,12 +29,24 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Hoist Streamlit Cloud secrets into os.environ so ask.call_llm() can read them.
+# Hoist Streamlit Cloud secrets into os.environ.
 try:
-    if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+        if k in st.secrets and not os.environ.get(k):
+            os.environ[k] = st.secrets[k]
 except Exception:
     pass
+
+# --- LLM config (OpenRouter, OpenAI-compatible) ----------------------------
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+FALLBACK_MODELS = [
+    DEFAULT_MODEL,
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-chat-v3.1:free",
+    "google/gemini-2.0-flash-exp:free",
+    "qwen/qwen3-30b-a3b:free",
+]
 
 import ask
 import chromadb
@@ -209,6 +221,43 @@ def _resolve_chat_file(file_path: str, folder_source: str) -> Path | None:
             if folder_source and folder_source in str(c):
                 return c
     return None
+
+
+def call_llm(question, hits, model):
+    """LLM call via OpenRouter (OpenAI-compatible API).
+    Reuses ask.SYSTEM_PROMPT and ask.dump_context so audit behavior is unchanged.
+    """
+    from openai import OpenAI
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. In Streamlit Cloud, open "
+            "Settings → Secrets and add:\n\n"
+            '    OPENROUTER_API_KEY = "sk-or-v1-..."'
+        )
+    client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=api_key,
+        # OpenRouter uses these for free-tier rate limiting and the model gallery.
+        default_headers={
+            "HTTP-Referer": "https://whatsappbk.streamlit.app",
+            "X-Title": "WhatsApp Forensic Audit",
+        },
+    )
+    user_msg = (
+        f"USER QUESTION:\n{question}\n\n"
+        f"EXCERPTS (already pre-sorted chronologically, {len(hits)} chunks):\n\n"
+        + ask.dump_context(hits)
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": ask.SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.0,
+    )
+    return resp.choices[0].message.content
 
 
 def read_context_window(file_path: str, start_line: int, end_line: int,
@@ -394,7 +443,25 @@ with st.sidebar:
 
     st.subheader("Retrieval")
     n_chunks = st.slider("Chunks to retrieve", 10, 200, 40, step=10)
-    model = st.selectbox("LLM model", ["gpt-4o", "gpt-4o-mini"], index=0)
+
+    st.subheader("LLM (via OpenRouter)")
+    model = st.selectbox(
+        "Model",
+        FALLBACK_MODELS,
+        index=0,
+        help=(
+            "Free OpenRouter models. If one is rate-limited or unavailable, "
+            "try another. Requires `OPENROUTER_API_KEY` in Streamlit Secrets."
+        ),
+    )
+    custom_model = st.text_input(
+        "Or paste a custom model ID",
+        value="",
+        placeholder="e.g. anthropic/claude-3.5-sonnet",
+        help="Overrides the dropdown. Leave empty to use the dropdown selection.",
+    )
+    if custom_model.strip():
+        model = custom_model.strip()
 
 # Main panel -----------------------------------------------------------------
 col_q, col_mode = st.columns([4, 1])
@@ -446,10 +513,8 @@ if run:
             st.warning("No chunks matched — skipping LLM.")
         else:
             try:
-                with st.spinner(f"Calling {model}..."):
-                    ai_summary = ask.call_llm(question.strip(), hits, model=model)
-            except SystemExit as e:
-                st.error(str(e))
+                with st.spinner(f"Calling {model} via OpenRouter..."):
+                    ai_summary = call_llm(question.strip(), hits, model=model)
             except Exception as e:
                 st.error(f"LLM call failed: {e}")
 
